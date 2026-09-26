@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -47,6 +47,10 @@ class MentorConfirmPayload(BaseModel):
 class LeaveCorrectionPayload(BaseModel):
     adjustment_seconds: int
     reason: str = ""
+    # 归属字段（可选）：明确更正作用的业务日期，或关联的原签到事件。
+    # 两者都缺失的历史记录仍可导入，重放时按确定性兜底规则分配并记入异常。
+    business_date: date | None = None
+    checkin_event_id: str | None = None
 
 
 class EventIn(BaseModel):
@@ -98,6 +102,19 @@ class AdjustmentOut(BaseModel):
     event_id: str
     seconds: int
     reason: str
+    business_date: str | None = None
+    checkin_event_id: str | None = None
+    attributed: bool = True
+    fallback_day: str | None = None
+
+
+class AnomalyOut(BaseModel):
+    anomaly_id: str
+    kind: str
+    event_id: str
+    student_id: str
+    seconds: int
+    detail: str
 
 
 class StudentProgressOut(BaseModel):
@@ -112,6 +129,7 @@ class StudentProgressOut(BaseModel):
     daily: list[DailyTotal]
     checkins: list[CheckinExplanation]
     adjustments: list[AdjustmentOut]
+    anomalies: list[AnomalyOut] = []
 
 
 class SnapshotOut(BaseModel):

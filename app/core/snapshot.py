@@ -70,8 +70,23 @@ def _student_to_dict(progress: StudentProgress, tz_name: str) -> dict[str, Any]:
                 "event_id": a.event_id,
                 "seconds": a.seconds,
                 "reason": a.reason,
+                "business_date": a.business_date,
+                "checkin_event_id": a.checkin_event_id,
+                "attributed": a.attributed,
+                "fallback_day": a.fallback_day,
             }
             for a in progress.adjustments
+        ],
+        "anomalies": [
+            {
+                "anomaly_id": an.anomaly_id,
+                "kind": an.kind.value,
+                "event_id": an.event_id,
+                "student_id": an.student_id,
+                "seconds": an.seconds,
+                "detail": an.detail,
+            }
+            for an in progress.anomalies
         ],
     }
 

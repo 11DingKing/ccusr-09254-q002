@@ -8,3 +8,6 @@ __pycache__/
 htmlcov/
 .env
 .DS_Store
+
+# SQLite 本地数据与测试产物
+*.db
