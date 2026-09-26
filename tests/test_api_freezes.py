@@ -64,6 +64,7 @@ def test_frozen_snapshot_immutable_after_late_correction(client):
                     "payload": {
                         "adjustment_seconds": 3600,
                         "reason": "approved make-up session",
+                        "academic_day": "2024-03-15",
                     },
                 }
             ]
@@ -109,7 +110,11 @@ def test_new_revision_includes_late_event_and_diff_explains_change(client):
                     "event_id": "E-09",
                     "event_type": "leave_correction",
                     "student_id": "S1",
-                    "payload": {"adjustment_seconds": 3600, "reason": "make-up"},
+                    "payload": {
+                        "adjustment_seconds": 3600,
+                        "reason": "make-up",
+                        "academic_day": "2024-03-15",
+                    },
                 }
             ]
         },
@@ -146,7 +151,11 @@ def test_explain_frozen_student_returns_breakdown(client):
                     "event_id": "E-02",
                     "event_type": "leave_correction",
                     "student_id": "S1",
-                    "payload": {"adjustment_seconds": -900, "reason": "late"},
+                    "payload": {
+                        "adjustment_seconds": -900,
+                        "reason": "late",
+                        "checkin_event_id": "E-01",
+                    },
                 },
             ]
         },

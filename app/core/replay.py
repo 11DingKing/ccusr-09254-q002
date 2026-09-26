@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import StrEnum
 from typing import Any, Iterable
 
 from .clock import (
-    academic_day,
     elapsed_seconds,
     merge_intervals,
     split_by_academic_day,
@@ -26,6 +25,21 @@ class EventType(StrEnum):
 class CheckinStatus(StrEnum):
     CONFIRMED = "CONFIRMED"
     PENDING = "PENDING"
+
+
+class AdjustmentTarget(StrEnum):
+    CHECKIN = "checkin"
+    ACADEMIC_DAY = "academic_day"
+    UNATTRIBUTED = "unattributed"
+
+
+class AnomalyCode(StrEnum):
+    INVALID_TARGET = "correction_invalid_target"
+    TARGET_MISSING = "correction_target_missing"
+    TARGET_PENDING = "correction_target_pending"
+    EXCEEDS_TARGET = "correction_exceeds_target"
+    UNATTRIBUTED = "correction_unattributed"
+    EXCEEDS_TOTAL = "correction_exceeds_student_total"
 
 
 INTERNSHIP_TYPE = "internship"
@@ -61,6 +75,37 @@ class CheckinRecord:
     def counts(self) -> bool:
         return self.status == CheckinStatus.CONFIRMED
 
+    def day_weights(self, tz_name: str) -> list[tuple[str, int]]:
+        """该签到在各教学日上的原始秒数权重（按日期排序）。"""
+        weights: dict[str, int] = {}
+        for day, seg_start, seg_end in split_by_academic_day(
+            self.start_utc, self.end_utc, tz_name
+        ):
+            key = day.isoformat()
+            weights[key] = weights.get(key, 0) + elapsed_seconds(seg_start, seg_end)
+        return sorted(weights.items())
+
+
+@dataclass(frozen=True)
+class DayAllocation:
+    """更正到具体教学日的有符号分摊结果；academic_day 为 None 表示未归属桶。"""
+
+    academic_day: str | None
+    seconds: int
+
+
+@dataclass(frozen=True)
+class AuditAnomaly:
+    """无法完整归属或超额扣减的可审计异常。"""
+
+    event_id: str
+    student_id: str
+    code: str
+    message: str
+    attempted_seconds: int
+    applied_seconds: int
+    detail: dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class Adjustment:
@@ -68,11 +113,21 @@ class Adjustment:
     student_id: str
     seconds: int
     reason: str
+    target_type: AdjustmentTarget = AdjustmentTarget.UNATTRIBUTED
+    checkin_event_id: str | None = None
+    academic_day: str | None = None
+    allocations: list[DayAllocation] = field(default_factory=list)
+    applied_seconds: int = 0
+    anomaly_codes: list[str] = field(default_factory=list)
+
+    @property
+    def is_fully_applied(self) -> bool:
+        return self.applied_seconds == self.seconds
 
 
 @dataclass
 class DayTotal:
-    academic_day: str
+    academic_day: str | None
     seconds: int
 
 
@@ -82,6 +137,7 @@ class StudentProgress:
     confirmed_seconds: int
     pending_seconds: int
     adjustment_seconds: int
+    allocated_adjustment_seconds: int
     total_seconds: int
     lesson_units: int
     pending_lesson_units: int
@@ -89,6 +145,7 @@ class StudentProgress:
     daily: list[DayTotal] = field(default_factory=list)
     checkins: list[CheckinRecord] = field(default_factory=list)
     adjustments: list[Adjustment] = field(default_factory=list)
+    anomalies: list[AuditAnomaly] = field(default_factory=list)
 
 
 @dataclass
@@ -120,6 +177,57 @@ def _parse_checkin(
     )
 
 
+def _parse_correction_target(
+    event: Event,
+) -> tuple[AdjustmentTarget, str | None, str | None, str | None]:
+    """解析更正的归属目标，返回 (目标类型, 签到ID, 教学日, 异常代码)。"""
+    target_checkin = event.payload.get("checkin_event_id")
+    raw_day = event.payload.get("academic_day")
+
+    if target_checkin is not None and raw_day is not None:
+        return AdjustmentTarget.UNATTRIBUTED, None, None, AnomalyCode.INVALID_TARGET
+
+    if target_checkin is not None:
+        if not isinstance(target_checkin, str) or not target_checkin:
+            return AdjustmentTarget.UNATTRIBUTED, None, None, AnomalyCode.INVALID_TARGET
+        return AdjustmentTarget.CHECKIN, target_checkin, None, None
+
+    if raw_day is not None:
+        if not isinstance(raw_day, str):
+            return AdjustmentTarget.UNATTRIBUTED, None, None, AnomalyCode.INVALID_TARGET
+        try:
+            day = date.fromisoformat(raw_day)
+        except ValueError:
+            return AdjustmentTarget.UNATTRIBUTED, None, None, AnomalyCode.INVALID_TARGET
+        return AdjustmentTarget.ACADEMIC_DAY, None, day.isoformat(), None
+
+    return AdjustmentTarget.UNATTRIBUTED, None, None, None
+
+
+def _distribute_positive(
+    amount: int, weights: list[tuple[str, int]]
+) -> list[tuple[str, int]]:
+    """按权重把正向秒数整数分摊（Hamilton 最大余数法，平局取较早日期）。"""
+    total_weight = sum(w for _, w in weights)
+    if amount <= 0 or total_weight <= 0:
+        return []
+    floors: list[tuple[str, int, float]] = []
+    allocated = 0
+    for day, weight in weights:
+        exact = amount * weight / total_weight
+        whole = int(exact)
+        floors.append((day, whole, exact - whole))
+        allocated += whole
+    leftover = amount - allocated
+    # 余数按小数部分降序、日期升序补发。
+    for day, _, _ in sorted(floors, key=lambda item: (-item[2], item[0]))[:leftover]:
+        for i, (d, whole, frac) in enumerate(floors):
+            if d == day:
+                floors[i] = (d, whole + 1, frac)
+                break
+    return [(day, whole) for day, whole, _ in floors if whole]
+
+
 def replay(
     events: Iterable[Event],
     *,
@@ -138,8 +246,10 @@ def replay(
 
     checkins_by_student: dict[str, list[CheckinRecord]] = {}
     checkin_index: dict[str, CheckinRecord] = {}
-    adjustments_by_student: dict[str, list[Adjustment]] = {}
+    corrections: list[Event] = []
 
+    # 第一遍：收集签到与导师确认。更正对原签到的引用必须无视事件 ID
+    # 先后顺序都能解析，因此放到第二遍处理。
     for event in sorted_events:
         if event.event_type == EventType.CHECKIN:
             record = _parse_checkin(event, timezone_name)
@@ -151,21 +261,33 @@ def replay(
             if target is not None and target.student_id == event.student_id:
                 target.status = CheckinStatus.CONFIRMED
         elif event.event_type == EventType.LEAVE_CORRECTION:
-            seconds = int(event.payload.get("adjustment_seconds", 0))
-            adjustments_by_student.setdefault(event.student_id, []).append(
-                Adjustment(
-                    event_id=event.event_id,
-                    student_id=event.student_id,
-                    seconds=seconds,
-                    reason=str(event.payload.get("reason", "")),
-                )
+            corrections.append(event)
+
+    adjustments_by_student: dict[str, list[Adjustment]] = {}
+    for event in corrections:
+        target_type, target_checkin, target_day, invalid_code = (
+            _parse_correction_target(event)
+        )
+        adjustments_by_student.setdefault(event.student_id, []).append(
+            Adjustment(
+                event_id=event.event_id,
+                student_id=event.student_id,
+                seconds=int(event.payload.get("adjustment_seconds", 0)),
+                reason=str(event.payload.get("reason", "")),
+                target_type=target_type,
+                checkin_event_id=target_checkin,
+                academic_day=target_day,
+                anomaly_codes=[invalid_code] if invalid_code else [],
             )
+        )
 
     all_students = set(checkins_by_student) | set(adjustments_by_student)
     students: dict[str, StudentProgress] = {}
     for student_id in all_students:
         records = checkins_by_student.get(student_id, [])
-        adjustments = adjustments_by_student.get(student_id, [])
+        adjustments = sorted(
+            adjustments_by_student.get(student_id, []), key=lambda a: a.event_id
+        )
 
         confirmed_intervals = [
             (r.start_utc, r.end_utc) for r in records if r.counts
@@ -178,37 +300,209 @@ def replay(
 
         confirmed_seconds = union_seconds(confirmed_intervals)
         pending_seconds = union_seconds(pending_intervals)
-        adjustment_seconds = sum(a.seconds for a in adjustments)
-        total_seconds = confirmed_seconds + adjustment_seconds
-        if total_seconds < 0:
-            total_seconds = 0
 
-        day_totals: dict[str, int] = {}
+        # 各教学日的已确认秒数余额；更正只能在余额范围内扣减。
+        day_balance: dict[str, int] = {}
         for start, end in merge_intervals(confirmed_intervals):
             for day, seg_start, seg_end in split_by_academic_day(
                 start, end, timezone_name
             ):
                 key = day.isoformat()
-                day_totals[key] = day_totals.get(key, 0) + elapsed_seconds(
+                day_balance[key] = day_balance.get(key, 0) + elapsed_seconds(
                     seg_start, seg_end
                 )
+
+        unallocated_seconds = 0
+        anomalies: list[AuditAnomaly] = []
+
+        def _anomaly(
+            adjustment: Adjustment,
+            code: AnomalyCode,
+            message: str,
+            *,
+            attempted: int | None = None,
+            applied: int | None = None,
+            detail: dict[str, Any] | None = None,
+        ) -> None:
+            if code not in adjustment.anomaly_codes:
+                adjustment.anomaly_codes.append(code)
+            anomalies.append(
+                AuditAnomaly(
+                    event_id=adjustment.event_id,
+                    student_id=student_id,
+                    code=code.value,
+                    message=message,
+                    attempted_seconds=(
+                        adjustment.seconds if attempted is None else attempted
+                    ),
+                    applied_seconds=(
+                        adjustment.applied_seconds if applied is None else applied
+                    ),
+                    detail=detail or {},
+                )
+            )
+
+        for adjustment in adjustments:
+            seconds = adjustment.seconds
+
+            # 解析归属目标并构造候选分摊日（带权重）。显式目标无法解析时，
+            # 该更正不生效，只进入可审计异常；完全没有目标的历史记录则
+            # 走尽力冲抵逻辑。
+            candidates: list[tuple[str, int]] = []
+            skip_application = False
+            if AnomalyCode.INVALID_TARGET in adjustment.anomaly_codes:
+                skip_application = True
+            elif adjustment.target_type == AdjustmentTarget.CHECKIN:
+                target = checkin_index.get(adjustment.checkin_event_id)
+                if target is None or target.student_id != student_id:
+                    _anomaly(
+                        adjustment,
+                        AnomalyCode.TARGET_MISSING,
+                        "correction references a check-in that does not exist",
+                        applied=0,
+                        detail={"checkin_event_id": adjustment.checkin_event_id},
+                    )
+                    skip_application = True
+                elif not target.counts:
+                    _anomaly(
+                        adjustment,
+                        AnomalyCode.TARGET_PENDING,
+                        "correction targets a check-in that is not confirmed yet",
+                        applied=0,
+                        detail={"checkin_event_id": adjustment.checkin_event_id},
+                    )
+                    skip_application = True
+                else:
+                    candidates = target.day_weights(timezone_name)
+            elif adjustment.target_type == AdjustmentTarget.ACADEMIC_DAY:
+                assert adjustment.academic_day is not None
+                candidates = [(adjustment.academic_day, 0)]
+            elif seconds != 0:
+                _anomaly(
+                    adjustment,
+                    AnomalyCode.UNATTRIBUTED,
+                    "correction is not linked to a business day or check-in",
+                    applied=0,
+                )
+
+            if skip_application:
+                continue
+
+            if seconds > 0 and candidates:
+                # 正向更正按权重归属到候选日，不设上限。
+                weights = [
+                    (day, max(weight, 1)) for day, weight in candidates
+                ]
+                for day, part in _distribute_positive(seconds, weights):
+                    day_balance[day] = day_balance.get(day, 0) + part
+                    adjustment.allocations.append(
+                        DayAllocation(academic_day=day, seconds=part)
+                    )
+                adjustment.applied_seconds = seconds
+            elif seconds < 0 and candidates:
+                # 负向更正按候选日时间顺序扣减；每日扣减额不得超过当日
+                # 余额，关联签到时还不得超过该签到在当日的原始时长，
+                # 任何一天都不能扣成负数。
+                remaining = -seconds
+                for day, weight in candidates:
+                    if remaining == 0:
+                        break
+                    current = day_balance.get(day, 0)
+                    available = current
+                    if adjustment.target_type == AdjustmentTarget.CHECKIN:
+                        available = min(available, weight)
+                    if available <= 0:
+                        continue
+                    taken = min(remaining, available)
+                    day_balance[day] = current - taken
+                    remaining -= taken
+                    adjustment.allocations.append(
+                        DayAllocation(academic_day=day, seconds=-taken)
+                    )
+                adjustment.applied_seconds = -(-seconds - remaining)
+                if remaining > 0:
+                    _anomaly(
+                        adjustment,
+                        AnomalyCode.EXCEEDS_TARGET,
+                        "correction exceeds confirmed seconds on the target day(s)",
+                        attempted=seconds,
+                        applied=adjustment.applied_seconds,
+                        detail={"unapplied_seconds": remaining},
+                    )
+            elif seconds > 0:
+                # 无有效目标的正向更正进入未归属桶。
+                unallocated_seconds += seconds
+                adjustment.applied_seconds = seconds
+                adjustment.allocations.append(
+                    DayAllocation(academic_day=None, seconds=seconds)
+                )
+            elif seconds < 0:
+                # 无有效目标的负向更正：先冲抵未归属正向余额，再按日期
+                # 顺序在各教学日已确认余额内扣减，任何一天都不得为负，
+                # 总量也不得为负；无法冲抵的部分进入可审计异常。
+                remaining = -seconds
+                if unallocated_seconds > 0:
+                    taken = min(remaining, unallocated_seconds)
+                    unallocated_seconds -= taken
+                    remaining -= taken
+                    adjustment.allocations.append(
+                        DayAllocation(academic_day=None, seconds=-taken)
+                    )
+                for day in sorted(day_balance):
+                    if remaining == 0:
+                        break
+                    available = day_balance[day]
+                    if available <= 0:
+                        continue
+                    taken = min(remaining, available)
+                    day_balance[day] = available - taken
+                    remaining -= taken
+                    adjustment.allocations.append(
+                        DayAllocation(academic_day=day, seconds=-taken)
+                    )
+                adjustment.applied_seconds = -(-seconds - remaining)
+                if remaining > 0:
+                    _anomaly(
+                        adjustment,
+                        AnomalyCode.EXCEEDS_TOTAL,
+                        "correction exceeds the student's confirmed total",
+                        attempted=seconds,
+                        applied=adjustment.applied_seconds,
+                        detail={"unapplied_seconds": remaining},
+                    )
+
         daily = [
             DayTotal(academic_day=day, seconds=secs)
-            for day, secs in sorted(day_totals.items())
+            for day, secs in sorted(day_balance.items())
         ]
+        if unallocated_seconds:
+            daily.append(
+                DayTotal(academic_day=None, seconds=unallocated_seconds)
+            )
+
+        raw_adjustment_seconds = sum(a.seconds for a in adjustments)
+        allocated_adjustment_seconds = sum(a.applied_seconds for a in adjustments)
+        total_seconds = confirmed_seconds + allocated_adjustment_seconds
+
+        # 核心不变量：总量恒等于各日合计，任何一天都不为负。
+        assert total_seconds == sum(d.seconds for d in daily)
+        assert total_seconds >= 0
+        assert all(d.seconds >= 0 for d in daily if d.academic_day is not None)
 
         students[student_id] = StudentProgress(
             student_id=student_id,
             confirmed_seconds=confirmed_seconds,
             pending_seconds=pending_seconds,
-            adjustment_seconds=adjustment_seconds,
+            adjustment_seconds=raw_adjustment_seconds,
+            allocated_adjustment_seconds=allocated_adjustment_seconds,
             total_seconds=total_seconds,
             lesson_units=total_seconds // (45 * 60),
             pending_lesson_units=pending_seconds // (45 * 60),
             meets_requirement=total_seconds >= required_seconds,
             daily=daily,
             checkins=sorted(records, key=lambda r: r.start_utc),
-            adjustments=sorted(adjustments, key=lambda a: a.event_id),
+            adjustments=adjustments,
+            anomalies=anomalies,
         )
 
     return ReplayState(

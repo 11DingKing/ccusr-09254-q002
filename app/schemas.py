@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -47,6 +47,27 @@ class MentorConfirmPayload(BaseModel):
 class LeaveCorrectionPayload(BaseModel):
     adjustment_seconds: int
     reason: str = ""
+    checkin_event_id: str | None = Field(default=None, min_length=1, max_length=128)
+    academic_day: date | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_target(self) -> "LeaveCorrectionPayload":
+        if self.checkin_event_id is not None and self.academic_day is not None:
+            raise ValueError(
+                "checkin_event_id and academic_day are mutually exclusive"
+            )
+        if self.checkin_event_id is None and self.academic_day is None:
+            raise ValueError(
+                "leave_correction must reference checkin_event_id or academic_day"
+            )
+        return self
+
+
+_PAYLOAD_MODELS = {
+    "checkin": CheckinPayload,
+    "mentor_confirm": MentorConfirmPayload,
+    "leave_correction": LeaveCorrectionPayload,
+}
 
 
 class EventIn(BaseModel):
@@ -54,6 +75,13 @@ class EventIn(BaseModel):
     event_type: Literal["checkin", "mentor_confirm", "leave_correction"]
     student_id: str = Field(..., min_length=1, max_length=128)
     payload: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _validate_typed_payload(self) -> "EventIn":
+        model = _PAYLOAD_MODELS[self.event_type]
+        validated = model.model_validate(self.payload)
+        object.__setattr__(self, "payload", validated.model_dump(mode="json"))
+        return self
 
 
 class EventBatchIn(BaseModel):
@@ -78,7 +106,7 @@ class ImportResult(BaseModel):
 
 
 class DailyTotal(BaseModel):
-    academic_day: str
+    academic_day: str | None
     seconds: int
 
 
@@ -94,10 +122,31 @@ class CheckinExplanation(BaseModel):
     academic_days: list[dict[str, Any]]
 
 
+class DayAllocationOut(BaseModel):
+    academic_day: str | None
+    seconds: int
+
+
 class AdjustmentOut(BaseModel):
     event_id: str
     seconds: int
+    applied_seconds: int
     reason: str
+    target_type: str
+    checkin_event_id: str | None
+    academic_day: str | None
+    allocations: list[DayAllocationOut]
+    anomaly_codes: list[str]
+
+
+class AnomalyOut(BaseModel):
+    event_id: str
+    student_id: str
+    code: str
+    message: str
+    attempted_seconds: int
+    applied_seconds: int
+    detail: dict[str, Any]
 
 
 class StudentProgressOut(BaseModel):
@@ -105,6 +154,7 @@ class StudentProgressOut(BaseModel):
     confirmed_seconds: int
     pending_seconds: int
     adjustment_seconds: int
+    allocated_adjustment_seconds: int
     total_seconds: int
     lesson_units: int
     pending_lesson_units: int
@@ -112,6 +162,7 @@ class StudentProgressOut(BaseModel):
     daily: list[DailyTotal]
     checkins: list[CheckinExplanation]
     adjustments: list[AdjustmentOut]
+    anomalies: list[AnomalyOut]
 
 
 class SnapshotOut(BaseModel):

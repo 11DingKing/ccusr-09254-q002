@@ -46,7 +46,7 @@ class Snapshot:
             required_seconds=data["required_seconds"],
             generated_at=data["generated_at"],
             event_cutoff_id=data.get("event_cutoff_id"),
-            students=list(data.get("students", [])),
+            students=[_normalize_student(s) for s in data.get("students", [])],
         )
 
 
@@ -56,6 +56,7 @@ def _student_to_dict(progress: StudentProgress, tz_name: str) -> dict[str, Any]:
         "confirmed_seconds": progress.confirmed_seconds,
         "pending_seconds": progress.pending_seconds,
         "adjustment_seconds": progress.adjustment_seconds,
+        "allocated_adjustment_seconds": progress.allocated_adjustment_seconds,
         "total_seconds": progress.total_seconds,
         "lesson_units": progress.lesson_units,
         "pending_lesson_units": progress.pending_lesson_units,
@@ -69,11 +70,51 @@ def _student_to_dict(progress: StudentProgress, tz_name: str) -> dict[str, Any]:
             {
                 "event_id": a.event_id,
                 "seconds": a.seconds,
+                "applied_seconds": a.applied_seconds,
                 "reason": a.reason,
+                "target_type": a.target_type.value,
+                "checkin_event_id": a.checkin_event_id,
+                "academic_day": a.academic_day,
+                "allocations": [
+                    {"academic_day": al.academic_day, "seconds": al.seconds}
+                    for al in a.allocations
+                ],
+                "anomaly_codes": list(a.anomaly_codes),
             }
             for a in progress.adjustments
         ],
+        "anomalies": [
+            {
+                "event_id": an.event_id,
+                "student_id": an.student_id,
+                "code": an.code,
+                "message": an.message,
+                "attempted_seconds": an.attempted_seconds,
+                "applied_seconds": an.applied_seconds,
+                "detail": an.detail,
+            }
+            for an in progress.anomalies
+        ],
     }
+
+
+def _normalize_student(raw: dict[str, Any]) -> dict[str, Any]:
+    """补齐旧版本快照缺失的字段，保证重启后仍可读取。"""
+    student = dict(raw)
+    student.setdefault("allocated_adjustment_seconds", student.get("adjustment_seconds", 0))
+    student.setdefault("anomalies", [])
+    normalized_adjustments: list[dict[str, Any]] = []
+    for adj in student.get("adjustments", []):
+        a = dict(adj)
+        a.setdefault("applied_seconds", a.get("seconds", 0))
+        a.setdefault("target_type", "unattributed")
+        a.setdefault("checkin_event_id", None)
+        a.setdefault("academic_day", None)
+        a.setdefault("allocations", [])
+        a.setdefault("anomaly_codes", [])
+        normalized_adjustments.append(a)
+    student["adjustments"] = normalized_adjustments
+    return student
 
 
 def build_snapshot(
@@ -162,6 +203,7 @@ def diff_snapshots(old: Snapshot, new: Snapshot) -> dict[str, Any]:
             "confirmed_seconds",
             "pending_seconds",
             "adjustment_seconds",
+            "allocated_adjustment_seconds",
             "total_seconds",
             "lesson_units",
             "pending_lesson_units",

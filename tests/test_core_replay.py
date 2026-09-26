@@ -8,6 +8,7 @@ import pytest
 
 from app.core.clock import to_lesson_units
 from app.core.replay import (
+    AdjustmentTarget,
     CheckinStatus,
     Event,
     EventType,
@@ -111,14 +112,19 @@ def test_overlapping_regular_checkins_are_unioned():
 
 def test_out_of_order_correction_converges():
     # A correction arriving before/after other events must not change the
-    # final total because replay sorts by event_id.
+    # final total because replay sorts by event_id, and the reference to the
+    # original check-in must resolve regardless of event-id ordering.
     base = [
         _checkin("E-03", "S1", "2024-03-15T08:00:00+08:00", "2024-03-15T10:00:00+08:00"),
         _event(
             "E-01",
             EventType.LEAVE_CORRECTION,
             "S1",
-            {"adjustment_seconds": -1800, "reason": "late arrival"},
+            {
+                "adjustment_seconds": -1800,
+                "reason": "late arrival",
+                "checkin_event_id": "E-03",
+            },
         ),
         _checkin("E-02", "S1", "2024-03-15T10:00:00+08:00", "2024-03-15T11:00:00+08:00"),
     ]
@@ -131,11 +137,15 @@ def test_out_of_order_correction_converges():
         timezone_name="Asia/Shanghai",
         required_seconds=3600,
     )
-    assert (
-        state_a.students["S1"].total_seconds
-        == state_b.students["S1"].total_seconds
-        == 3 * 3600 - 1800
-    )
+    for state in (state_a, state_b):
+        progress = state.students["S1"]
+        assert progress.total_seconds == 3 * 3600 - 1800
+        assert sum(d.seconds for d in progress.daily) == progress.total_seconds
+        adjustment = progress.adjustments[0]
+        assert adjustment.target_type == AdjustmentTarget.CHECKIN
+        assert adjustment.applied_seconds == -1800
+        assert adjustment.allocations[0].academic_day == "2024-03-15"
+        assert not progress.anomalies
 
 
 def test_mentor_confirm_for_wrong_student_is_ignored():
